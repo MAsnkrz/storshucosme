@@ -262,15 +262,40 @@ def scrape_product_detail(product):
         if bc_m:
             product["barcode"] = bc_m.group(1)
 
-    # Price — prefer "WAS £X NOW £Y" sale pattern, else plain "£X.XX"
-    sale_m = re.search(r"WAS\s*£\s*([\d.]+)\s*NOW\s*£\s*([\d.]+)", text, re.IGNORECASE)
-    if sale_m:
-        product["compare_price"] = sale_m.group(1)
-        product["price"] = sale_m.group(2)
+    # Price — prefer the confirmed product price element (same EKM theme
+    # component used on listing pages: <span class="price">£X.XX</span>).
+    # A blind regex over the whole page text was unreliable — it could
+    # match an unrelated £ amount first (delivery banners, basket
+    # subtotal showing "£0.00", etc.) before reaching the real price.
+    price_el = soup.find("span", class_="price")
+    if price_el:
+        price_text = price_el.get_text(" ", strip=True)
+        sale_m = re.search(r"WAS\s*£\s*([\d.]+)\s*NOW\s*£\s*([\d.]+)", price_text, re.IGNORECASE)
+        if sale_m:
+            product["compare_price"] = sale_m.group(1)
+            product["price"] = sale_m.group(2)
+        else:
+            price_m = re.search(r"([\d.]+)", price_text)
+            if price_m:
+                product["price"] = price_m.group(1)
     else:
-        price_m = re.search(r"£\s*([\d.]+)", text)
-        if price_m:
-            product["price"] = price_m.group(1)
+        # Fallback: "WAS £X NOW £Y" sale pattern anywhere on the page,
+        # else the first £ amount (least reliable, last resort)
+        sale_m = re.search(r"WAS\s*£\s*([\d.]+)\s*NOW\s*£\s*([\d.]+)", text, re.IGNORECASE)
+        if sale_m:
+            product["compare_price"] = sale_m.group(1)
+            product["price"] = sale_m.group(2)
+        else:
+            price_m = re.search(r"£\s*([\d.]+)", text)
+            if price_m:
+                product["price"] = price_m.group(1)
+
+    # Sanity guard: a scraped price of exactly 0 is virtually always a
+    # scraping error (no wholesale cosmetics product is free), not a
+    # real price. Discard it so check_changes() falls back to the last
+    # known good price from the snapshot instead.
+    if product.get("price") in ("0", "0.0", "0.00"):
+        product["price"] = ""
 
     # Exact stock count, if the theme exposes it (varies by product/theme block)
     stock_m = re.search(r"(\d+)\s+(?:in stock|available|units? available)", text, re.IGNORECASE)
@@ -297,6 +322,20 @@ def scrape_product_detail(product):
     og_img = soup.find("meta", property="og:image")
     if og_img and og_img.get("content"):
         product["image"] = og_img["content"]
+
+    # Variant/shade options — products with "(Options)" in the title are
+    # sold as a single wholesale assortment covering multiple shades
+    # (e.g. "Options: 040 Tan, 050 Rich" — one price/stock for the whole
+    # mixed pack, not separate variants with their own price/stock/URL).
+    # We surface the shade list on the alert so it's visible, but don't
+    # track each shade as a separate snapshot entry since there's no
+    # separate price/stock data to compare per shade on this storefront.
+    options_m = re.search(r"Options:\s*([^.]+?)(?:\.\s|Please note|$)", text)
+    if options_m:
+        shades = options_m.group(1).strip().rstrip(",")
+        product["variant_options"] = shades
+    else:
+        product.setdefault("variant_options", "")
 
     return product
 
@@ -348,6 +387,13 @@ def _base_fields(product):
         {"name": "🔢 Barcode", "value": f"`{barcode}`" if barcode else "-", "inline": True},
         {"name": "📊 Stock",   "value": stock_val,                          "inline": True},
     ]
+
+    shades = product.get("variant_options", "")
+    if shades:
+        # Cap length so one product with many shades doesn't blow out the embed
+        display_shades = shades if len(shades) <= 300 else shades[:297] + "..."
+        fields.append({"name": "🎨 Shades in this pack", "value": display_shades, "inline": False})
+
     if sas_url:
         fields.append({"name": "🔍 SellerAmp SAS", "value": f"[Open in SellerAmp]({sas_url})", "inline": False})
     return fields
@@ -375,15 +421,20 @@ def _thumbnail(product):
 def _price_display(product):
     price   = product.get("price", "")
     compare = product.get("compare_price", "")
+    if price in ("0", "0.0", "0.00"):
+        price = ""
     if compare and compare != price:
-        return f"£{compare} -> **£{price}**"
+        return f"£{compare} -> **£{price}**" if price else "-"
     return f"**£{price}**" if price else "-"
 
 
 def notify_new(product):
+    price = product.get("price", "")
+    if price in ("0", "0.0", "0.00"):
+        price = ""
     fields = [
-        {"name": "💰 Price (ex. VAT)",  "value": _price_display(product),                               "inline": True},
-        {"name": "💷 Price (inc. VAT)", "value": f"£{vat_price(product.get('price', ''))}" if product.get("price") else "-", "inline": True},
+        {"name": "💰 Price (ex. VAT)",  "value": _price_display(product),                "inline": True},
+        {"name": "💷 Price (inc. VAT)", "value": f"£{vat_price(price)}" if price else "-", "inline": True},
     ] + _base_fields(product)
 
     embed = {
@@ -460,9 +511,12 @@ def notify_stock_change(product, old_stock, new_stock):
 
 
 def notify_back_in_stock(product):
+    price = product.get("price", "")
+    if price in ("0", "0.0", "0.00"):
+        price = ""
     fields = [
-        {"name": "💰 Price (ex. VAT)",  "value": _price_display(product),                               "inline": True},
-        {"name": "💷 Price (inc. VAT)", "value": f"£{vat_price(product.get('price', ''))}" if product.get("price") else "-", "inline": True},
+        {"name": "💰 Price (ex. VAT)",  "value": _price_display(product),                "inline": True},
+        {"name": "💷 Price (inc. VAT)", "value": f"£{vat_price(price)}" if price else "-", "inline": True},
     ] + _base_fields(product)
 
     embed = {
@@ -510,16 +564,17 @@ def save_snapshot(data):
 
 def snapshot_entry(product):
     return {
-        "title":         product.get("title", ""),
-        "url":           product.get("url", ""),
-        "image":         product.get("image", ""),
-        "barcode":       product.get("barcode", ""),
-        "price":         product.get("price", ""),
-        "compare_price": product.get("compare_price", ""),
-        "in_stock":      product.get("in_stock", True),
-        "stock":         product.get("stock"),
-        "first_seen":    product.get("first_seen", datetime.now(timezone.utc).isoformat()),
-        "last_updated":  datetime.now(timezone.utc).isoformat(),
+        "title":           product.get("title", ""),
+        "url":             product.get("url", ""),
+        "image":           product.get("image", ""),
+        "barcode":         product.get("barcode", ""),
+        "price":           product.get("price", ""),
+        "compare_price":   product.get("compare_price", ""),
+        "in_stock":        product.get("in_stock", True),
+        "stock":           product.get("stock"),
+        "variant_options": product.get("variant_options", ""),
+        "first_seen":      product.get("first_seen", datetime.now(timezone.utc).isoformat()),
+        "last_updated":    datetime.now(timezone.utc).isoformat(),
     }
 
 # ---------------------------------------------------------------------------
@@ -536,16 +591,19 @@ def check_changes(product, old):
     No alerts for: price increases, stock decreases, going OOS.
     """
     old_price    = old.get("price", "")
-    new_price    = product.get("price", "")
     old_stock    = old.get("stock")
     new_stock    = product.get("stock")
     was_in_stock = old.get("in_stock", True)
     now_in_stock = product.get("in_stock", True)
 
-    for key in ("image", "barcode"):
+    # Backfill missing fields from the snapshot BEFORE computing comparisons,
+    # so a failed detail-page price scrape doesn't show £0.00 in the embed
+    # or silently break price-drop detection.
+    for key in ("image", "barcode", "price", "variant_options"):
         if not product.get(key):
             product[key] = old.get(key, "")
 
+    new_price = product.get("price", "")
     old_f = safe_float(old_price)
     new_f = safe_float(new_price)
 
