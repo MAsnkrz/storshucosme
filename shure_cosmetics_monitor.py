@@ -43,6 +43,16 @@ CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "1800"))  # 30 min
 
 DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK", "")
 
+# Only monitor products from these brands (case-insensitive title match)
+MONITORED_BRANDS = {"maybelline", "loreal", "l'oreal", "l oreal", "rimmel", "revolution"}
+FNF_ROLE_ID = "1019772687528235099"
+FNF_MENTION  = f"<@&{FNF_ROLE_ID}>"
+
+def is_monitored_brand(title):
+    """Return True if the product title contains one of the monitored brands."""
+    title_lower = title.lower()
+    return any(brand in title_lower for brand in MONITORED_BRANDS)
+
 # Top-level category pages to crawl for full-catalogue coverage.
 # Confirmed top nav: Cosmetics, Skin Care, Fragrances, Nails, Hair,
 # Home Essentials, Gift Sets, Seasonal, Vegan, Sales.
@@ -267,6 +277,10 @@ def scrape_product_detail(product):
     # A blind regex over the whole page text was unreliable — it could
     # match an unrelated £ amount first (delivery banners, basket
     # subtotal showing "£0.00", etc.) before reaching the real price.
+    # For options products EKM renders "£0.00 £2.75" — the first value
+    # is the basket price placeholder, the second is the real unit price.
+    # We find ALL price values in the price element and take the first
+    # non-zero one, which is always the real selling price.
     price_el = soup.find("span", class_="price")
     if price_el:
         price_text = price_el.get_text(" ", strip=True)
@@ -275,20 +289,24 @@ def scrape_product_detail(product):
             product["compare_price"] = sale_m.group(1)
             product["price"] = sale_m.group(2)
         else:
-            price_m = re.search(r"([\d.]+)", price_text)
-            if price_m:
-                product["price"] = price_m.group(1)
+            # Find all prices and use the first non-zero one
+            all_prices = re.findall(r"([\d]+\.[\d]{2})", price_text)
+            for p in all_prices:
+                if float(p) > 0:
+                    product["price"] = p
+                    break
     else:
-        # Fallback: "WAS £X NOW £Y" sale pattern anywhere on the page,
-        # else the first £ amount (least reliable, last resort)
         sale_m = re.search(r"WAS\s*£\s*([\d.]+)\s*NOW\s*£\s*([\d.]+)", text, re.IGNORECASE)
         if sale_m:
             product["compare_price"] = sale_m.group(1)
             product["price"] = sale_m.group(2)
         else:
-            price_m = re.search(r"£\s*([\d.]+)", text)
-            if price_m:
-                product["price"] = price_m.group(1)
+            # Find all £ amounts and use first non-zero
+            all_prices = re.findall(r"£\s*([\d]+\.[\d]{2})", text)
+            for p in all_prices:
+                if float(p) > 0:
+                    product["price"] = p
+                    break
 
     # Sanity guard: a scraped price of exactly 0 is virtually always a
     # scraping error (no wholesale cosmetics product is free), not a
@@ -357,12 +375,22 @@ def safe_float(val):
         return None
 
 
-def selleramp_url(barcode, cost_price_str):
+def selleramp_url_ean(barcode, cost_price_str):
     if not barcode:
         return None
     return (
         f"https://sas.selleramp.com/sas/lookup/"
         f"?search_term={barcode}&sas_cost_price={vat_price(cost_price_str)}"
+    )
+
+
+def selleramp_url_title(title, cost_price_str):
+    if not title:
+        return None
+    from urllib.parse import quote as _q
+    return (
+        f"https://sas.selleramp.com/sas/lookup/"
+        f"?search_term={_q(title)}&sas_cost_price={vat_price(cost_price_str)}"
     )
 
 # ---------------------------------------------------------------------------
@@ -371,10 +399,12 @@ def selleramp_url(barcode, cost_price_str):
 
 def _base_fields(product):
     barcode  = product.get("barcode", "")
+    title    = product.get("title", "")
     stock    = product.get("stock")
     in_stock = product.get("in_stock", True)
     price    = product.get("price", "")
-    sas_url  = selleramp_url(barcode, price)
+    sas_ean   = selleramp_url_ean(barcode, price)
+    sas_title = selleramp_url_title(title, price)
 
     if stock is not None:
         stock_val = f"**{stock}** units"
@@ -390,17 +420,20 @@ def _base_fields(product):
 
     shades = product.get("variant_options", "")
     if shades:
-        # Cap length so one product with many shades doesn't blow out the embed
         display_shades = shades if len(shades) <= 300 else shades[:297] + "..."
         fields.append({"name": "🎨 Shades in this pack", "value": display_shades, "inline": False})
 
-    if sas_url:
-        fields.append({"name": "🔍 SellerAmp SAS", "value": f"[Open in SellerAmp]({sas_url})", "inline": False})
+    if sas_title:
+        fields.append({"name": "🔍 SAS Title", "value": f"[Search by title]({sas_title})", "inline": True})
+    if sas_ean:
+        fields.append({"name": "🔍 SAS EAN", "value": f"[Search by barcode]({sas_ean})", "inline": True})
     return fields
 
 
-def _send_embed(embed):
+def _send_embed(embed, content=None):
     payload = {"embeds": [embed]}
+    if content:
+        payload["content"] = content
     try:
         r = requests.post(DISCORD_WEBHOOK, json=payload, timeout=10)
         if r.status_code == 429:
@@ -483,7 +516,8 @@ def notify_price_change(product, old_price, new_price, pct_change):
     }
     t = _thumbnail(product)
     if t: embed["thumbnail"] = t
-    _send_embed(embed)
+    mention = FNF_MENTION if pct_change >= 0.25 else None
+    _send_embed(embed, content=mention)
     print(f"  Discord: PRICE DROP -{pct_display} — {product.get('title', '')[:50]}")
 
 
@@ -573,6 +607,7 @@ def snapshot_entry(product):
         "in_stock":        product.get("in_stock", True),
         "stock":           product.get("stock"),
         "variant_options": product.get("variant_options", ""),
+        "shade_stock":     product.get("shade_stock", {}),
         "first_seen":      product.get("first_seen", datetime.now(timezone.utc).isoformat()),
         "last_updated":    datetime.now(timezone.utc).isoformat(),
     }
@@ -584,10 +619,9 @@ def snapshot_entry(product):
 def check_changes(product, old):
     """
     Only fires alerts for:
-      - Back in stock (was OOS, now has stock) — takes priority
-      - Restock (stock increased meaningfully while already in stock,
-        only when an exact count is available on this storefront)
-      - Price drop (decreased by more than 1% AND more than £0.02)
+      - Back in stock (whole product or individual shades for options)
+      - Restock (stock count increased meaningfully)
+      - Price drop (>=5% AND >£0.05)
     No alerts for: price increases, stock decreases, going OOS.
     """
     old_price    = old.get("price", "")
@@ -596,9 +630,7 @@ def check_changes(product, old):
     was_in_stock = old.get("in_stock", True)
     now_in_stock = product.get("in_stock", True)
 
-    # Backfill missing fields from the snapshot BEFORE computing comparisons,
-    # so a failed detail-page price scrape doesn't show £0.00 in the embed
-    # or silently break price-drop detection.
+    # Backfill missing fields from snapshot
     for key in ("image", "barcode", "price", "variant_options"):
         if not product.get(key):
             product[key] = old.get(key, "")
@@ -607,7 +639,24 @@ def check_changes(product, old):
     old_f = safe_float(old_price)
     new_f = safe_float(new_price)
 
-    if not was_in_stock and now_in_stock:
+    # --- Per-shade back-in-stock for options products ---
+    old_shade_stock = old.get("shade_stock", {})
+    new_shade_stock = product.get("shade_stock", {})
+
+    if old_shade_stock and new_shade_stock:
+        # Find shades that were OOS and are now in stock
+        newly_available = [
+            shade for shade, in_stock in new_shade_stock.items()
+            if in_stock and not old_shade_stock.get(shade, True)
+        ]
+        if newly_available:
+            # Build a modified product showing only the newly available shades
+            p = dict(product)
+            p["variant_options"] = f"✅ NOW IN STOCK: {', '.join(newly_available)}"
+            notify_back_in_stock(p)
+            time.sleep(1)
+    elif not was_in_stock and now_in_stock:
+        # Whole-product back in stock (no per-shade data)
         notify_back_in_stock(product)
         time.sleep(1)
         return
@@ -615,7 +664,7 @@ def check_changes(product, old):
     if old_f and new_f and old_f > 0:
         pct_change = (old_f - new_f) / old_f
         abs_change = old_f - new_f
-        if pct_change > 0.01 and abs_change > 0.02:
+        if pct_change >= 0.05 and abs_change > 0.05:  # 5%+ AND £0.05+ absolute
             notify_price_change(product, old_price, new_price, pct_change)
             time.sleep(1)
 
@@ -650,6 +699,10 @@ def run_check():
         print(f"  First run — building baseline from {len(all_products)} products (no alerts)...")
     else:
         print(f"  {len(all_products)} products found, {len(new_handles)} new")
+
+    # Filter to monitored brands only before processing
+    all_products = [p for p in all_products if is_monitored_brand(p.get("title", ""))]
+    print(f"  {len(all_products)} products from monitored brands (Maybelline, L'Oréal, Rimmel, Revolution)")
 
     for i, product in enumerate(all_products, 1):
         handle = product["handle"]
@@ -701,7 +754,7 @@ def run_check():
 
 def main():
     print("=" * 55)
-    print("  Shure Cosmetics Monitor (whole site)")
+    print("  Shure Cosmetics Monitor — Maybelline | L'Oréal | Rimmel | Revolution")
     print(f"  Watching: {BASE_URL}")
     print("  Tracking: new listings, price drops, restocks")
     print("=" * 55)
