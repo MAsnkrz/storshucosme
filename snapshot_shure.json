@@ -11,62 +11,62 @@
     "variant_options": "",
     "shade_stock": {},
     "first_seen": "2026-07-10T00:15:53.996908+00:00",
-    "last_updated": "2026-07-16T14:34:11.814634+00:00"
+    "last_updated": "2026-07-16T16:20:35.969154+00:00"
   },
   "rimmel-kind-free-brow-definer-pencil-3pcs-options-150each": {
     "title": "Rimmel Kind & Free Brow Definer Pencil (3pcs) (Options) (\u00a31.50/each)byRimmel",
     "url": "https://store.shure-cosmetics.co.uk/rimmel-kind-free-brow-definer-pencil-3pcs-options-150each",
     "image": "https://cdn.ecommercedns.uk/files/6/267466/9/53130439/brow-definer.jpg",
-    "barcode": "145678806389",
-    "price": "78.00",
+    "barcode": "265618591496",
+    "price": "1.25",
     "compare_price": "",
     "in_stock": true,
-    "stock": 0,
+    "stock": 25,
     "variant_options": "001 Blonde, 002 Taupe, 003 Warm Brown, 005 Chocolate",
     "shade_stock": {},
     "first_seen": "2026-07-10T00:15:57.428284+00:00",
-    "last_updated": "2026-07-16T14:34:15.053078+00:00"
+    "last_updated": "2026-07-16T16:20:42.974717+00:00"
   },
   "rimmel-kind-free-creamy-blusher---15ml-options": {
     "title": "Rimmel Kind & Free Creamy Blusher - 15ml (Options)byRimmel",
     "url": "https://store.shure-cosmetics.co.uk/rimmel-kind-free-creamy-blusher---15ml-options",
     "image": "https://cdn.ecommercedns.uk/files/6/267466/5/53129765/kind-free-creamy-blusher.jpg",
-    "barcode": "133623729795",
-    "price": "21.40",
+    "barcode": "284968851857",
+    "price": "11.10",
     "compare_price": "",
-    "in_stock": true,
-    "stock": 40,
+    "in_stock": false,
+    "stock": 5,
     "variant_options": "001 Power Pink, 003 Copper Kiss, 004 Berry Indulgent",
     "shade_stock": {},
     "first_seen": "2026-07-10T00:16:00.702775+00:00",
-    "last_updated": "2026-07-16T14:34:20.680106+00:00"
+    "last_updated": "2026-07-16T16:20:47.896824+00:00"
   },
   "rimmel-kind-free-clean-plant-based-nail-polish---8ml-12pcs-assorted-bag": {
     "title": "Rimmel Kind & Free Clean Plant Based Nail Polish - 8ml (12pcs) (Assorted Bag)byRimmel",
     "url": "https://store.shure-cosmetics.co.uk/rimmel-kind-free-clean-plant-based-nail-polish---8ml-12pcs-assorted-bag",
     "image": "https://cdn.ecommercedns.uk/files/6/267466/8/56961678/kind-free-nail-polish.jpg",
     "barcode": "323266257703",
-    "price": "1.50",
+    "price": "35.40",
     "compare_price": "",
     "in_stock": true,
-    "stock": 50,
+    "stock": 40,
     "variant_options": "",
     "shade_stock": {},
     "first_seen": "2026-07-10T00:16:04.596306+00:00",
-    "last_updated": "2026-07-16T14:34:25.550187+00:00"
+    "last_updated": "2026-07-16T16:20:51.220163+00:00"
   },
   "rimmel-kind-free-clean-plant-based-nail-polish---8ml-options": {
     "title": "Rimmel Kind & Free Clean Plant Based Nail Polish - 8ml (Options)byRimmel",
     "url": "https://store.shure-cosmetics.co.uk/rimmel-kind-free-clean-plant-based-nail-polish---8ml-options",
     "image": "https://cdn.ecommercedns.uk/files/6/267466/1/56953681/kind-free-nail-polish.jpg",
     "barcode": "155179942186",
-    "price": "0.95",
+    "price": "9.15",
     "compare_price": "",
     "in_stock": false,
-    "stock": 50,
+    "stock": 10,
     "variant_options": "",
     "shade_stock": {},
     "first_seen": "2026-07-10T00:16:08.328896+00:00",
-    "last_updated": "2026-07-16T14:34:29.879818+00:00"
+    "last_updated": "2026-07-16T16:20:54.781769+00:00"
   }
 }
