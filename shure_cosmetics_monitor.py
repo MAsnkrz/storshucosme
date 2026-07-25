@@ -1,24 +1,25 @@
 """
-Shure Cosmetics Monitor
-Monitors https://store.shure-cosmetics.co.uk/ (EKM platform — no public API,
-so this uses HTML scraping like the wholesale-cosmetics/central-cosmetics
-monitors).
+Shure Cosmetics Monitor — Clean Rewrite
+Monitors https://store.shure-cosmetics.co.uk/wholesale-cosmetics?all=1
 
-There is no dedicated "New Arrivals" page on this storefront, so the
-monitor crawls every top-level category using the `?all=1` query param,
-which loads the entire category on a single page (confirmed working)
-instead of paginating. New listings are detected purely by comparing
-each run's full product set against the saved snapshot.
+Alerts on:
+  🆕 New product listings (in stock only)
+  🟢 Back in stock (whole product or individual shade)
+  📉 Price drops (>=5% AND >£0.05)
 
-Detects (Discord alerts fire ONLY for these):
-  - New product listings (in stock only)
-  - Price drops (decreased >1% and >£0.02)
-  - Restocks (stock increased meaningfully, if a quantity is shown) /
-    Back in stock (was OOS — page showed "notify me" form — now in stock)
-
-Does NOT alert on: price increases, stock decreases, going OOS.
+Key fixes over previous version:
+  - No more repeat pings — existing products only scraped when needed
+  - Options products handled properly — each shade tracked individually
+    as a separate snapshot key (handle::shade_name)
+  - OOS detection uses scraper logic (disabled attr + text signals)
+  - Atomic snapshot saves
 
 Deps: pip install requests beautifulsoup4
+
+Env vars:
+  DISCORD_WEBHOOK   required
+  CHECK_INTERVAL    seconds between checks (default 1800 = 30 min)
+  RUN_ONCE          "true" for GitHub Actions
 """
 
 import json
@@ -27,48 +28,22 @@ import re
 import time
 import random
 import requests
-from datetime import datetime, timezone
 from bs4 import BeautifulSoup
+from datetime import datetime, timezone
+from urllib.parse import quote
 
 # ---------------------------------------------------------------------------
 # CONFIG
 # ---------------------------------------------------------------------------
 
-BASE_URL       = "https://store.shure-cosmetics.co.uk"
-SNAPSHOT_FILE  = "snapshot_shure.json"
-BASELINE_FLAG  = "baseline_done_shure.txt"
-REQUEST_DELAY  = 2.0
-RUN_ONCE       = os.getenv("RUN_ONCE", "false").lower() == "true"
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "1800"))  # 30 min
-
+BASE_URL        = "https://store.shure-cosmetics.co.uk"
+LISTING_URL     = f"{BASE_URL}/wholesale-cosmetics"
+SNAPSHOT_FILE   = "snapshot_shure.json"
+BASELINE_FLAG   = "baseline_done_shure.txt"
+REQUEST_DELAY   = 2.0
+CHECK_INTERVAL  = int(os.getenv("CHECK_INTERVAL", "1800"))
+RUN_ONCE        = os.getenv("RUN_ONCE", "false").lower() == "true"
 DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK", "")
-
-# Only monitor products from these brands (case-insensitive title match)
-MONITORED_BRANDS = {"maybelline", "loreal", "l'oreal", "l oreal", "rimmel", "revolution"}
-FNF_ROLE_ID = "1019772687528235099"
-FNF_MENTION  = f"<@&{FNF_ROLE_ID}>"
-
-def is_monitored_brand(title):
-    """Return True if the product title contains one of the monitored brands."""
-    title_lower = title.lower()
-    return any(brand in title_lower for brand in MONITORED_BRANDS)
-
-# Top-level category pages to crawl for full-catalogue coverage.
-# Confirmed top nav: Cosmetics, Skin Care, Fragrances, Nails, Hair,
-# Home Essentials, Gift Sets, Seasonal, Vegan, Sales.
-# (EKM has no public products API or working "New Arrivals" page, so we
-# crawl every top-level category with ?all=1, which loads the entire
-# category on a single page instead of paginating.)
-CATEGORY_PAGES = [
-    "wholesale-cosmetics",
-    "skin-care",
-    "fragrance",
-    "wholesale-nail",
-    "hair",
-    "home-care",
-    "gift-sets",
-    "self-tan-and-suntan",
-]
 
 HEADERS = {
     "User-Agent": (
@@ -76,364 +51,261 @@ HEADERS = {
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/124.0.0.0 Safari/537.36"
     ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-GB,en;q=0.9",
+    "Accept": "text/html,application/xhtml+xml,*/*;q=0.9",
 }
 
 SESSION = requests.Session()
 SESSION.headers.update(HEADERS)
 
-# Discord embed colours
-COLOUR_NEW     = 0xE91E8C   # pink — new listing
-COLOUR_RESTOCK = 0x3498DB   # blue — restock
-COLOUR_BACK    = 0x9B59B6   # purple — back in stock
-# Price drop colours are tiered by severity — see notify_price_change()
+COLOUR_NEW   = 0xE91E8C
+COLOUR_BACK  = 0x9B59B6
+COLOUR_DROP  = 0x00C853
 
 # ---------------------------------------------------------------------------
-# HTTP HELPERS
+# SCRAPING — listing page
 # ---------------------------------------------------------------------------
 
-def get_soup(url, retries=3):
-    for attempt in range(retries):
-        try:
-            r = SESSION.get(url, timeout=20)
-            if r.status_code == 429:
-                wait = 20 * (attempt + 1)
-                print(f"  [!] Rate limited — waiting {wait}s")
-                time.sleep(wait)
-                continue
-            r.raise_for_status()
-            return BeautifulSoup(r.text, "html.parser")
-        except Exception as e:
-            print(f"  [!] Fetch error ({url}): {e} — attempt {attempt+1}/{retries}")
-            if attempt < retries - 1:
-                time.sleep(4 * (attempt + 1))
-    return None
-
-# ---------------------------------------------------------------------------
-# SCRAPING — LISTING PAGES (category + new arrivals)
-# ---------------------------------------------------------------------------
-
-def scrape_listing_page(url):
+def fetch_all_listing_products():
     """
-    Scrape one listing/category page. Returns (products, has_next_page_url).
-
-    Confirmed EKM theme structure for this storefront:
-      <article class="item-box product-box">
-        <div class="item-image">
-          <a href="...">
-            <img class="item-img lazy" data-src="..." />
-          </a>
-        </div>
-        <div class="item-title-box">
-          <h3 class="item-title"><a href="...">Title (code) (code)</a></h3>
-          <div class="box-data grid">
-            <span class="price">£X.XX</span>
-            <span class="item-in-stock item-stock">In stock</span>
-              (or item-out-of-stock / "Out of stock")
-            <a class="wishlist-button" href="/wishlist?action=add&product_id=N">
-          </div>
-        </div>
-      </article>
+    Scrape /wholesale-cosmetics?all=1 with pagination.
+    Returns flat list of basic product dicts.
+    OOS products on the listing are included so we can detect restocks.
     """
-    soup = get_soup(url)
-    if not soup:
-        return [], None
-
-    products = []
-    seen = set()
-
-    cards = soup.find_all("article", class_=re.compile(r"\bproduct-box\b"))
-
-    for card in cards:
-        title_el = card.find("h3", class_="item-title")
-        if not title_el:
-            continue
-        link = title_el.find("a", href=True)
-        if not link:
-            continue
-
-        href = link["href"]
-        path = href.replace(BASE_URL, "").strip("/")
-        if not path or path in seen:
-            continue
-        seen.add(path)
-
-        title = link.get_text(strip=True)
-
-        price_el = card.find("span", class_="price")
-        price = ""
-        if price_el:
-            price_m = re.search(r"([\d]+\.[\d]{2})", price_el.get_text())
-            if price_m:
-                price = price_m.group(1)
-
-        stock_el = card.find("span", class_=re.compile(r"item-(in|out-of)-stock"))
-        if stock_el:
-            stock_classes = " ".join(stock_el.get("class", []))
-            in_stock = "out-of-stock" not in stock_classes and "out of stock" not in stock_el.get_text(strip=True).lower()
-        else:
-            card_text = card.get_text(" ", strip=True)
-            in_stock = "out of stock" not in card_text.lower()
-
-        img = card.find("img")
-        image = ""
-        if img:
-            image = img.get("data-src") or img.get("src") or ""
-            if image and not image.startswith("http"):
-                image = "https:" + image if image.startswith("//") else BASE_URL + image
-
-        # Product ID from the wishlist link, if present (useful as a stable key)
-        product_id = ""
-        wishlist_a = card.find("a", class_=re.compile(r"wishlist-button"))
-        if wishlist_a and wishlist_a.get("href"):
-            pid_m = re.search(r"product_id=(\d+)", wishlist_a["href"])
-            if pid_m:
-                product_id = pid_m.group(1)
-
-        products.append({
-            "handle":     path,
-            "product_id": product_id,
-            "title":      title,
-            "url":        f"{BASE_URL}/{path}",
-            "price":      price,
-            "in_stock":   in_stock,
-            "image":      image,
-        })
-
-    # Pagination — not used when called with ?all=1, but kept as a fallback
-    next_link = soup.find("a", rel="next") or soup.find("a", string=re.compile(r"Next", re.IGNORECASE))
-    next_url = None
-    if next_link and next_link.get("href"):
-        href = next_link["href"]
-        next_url = href if href.startswith("http") else BASE_URL + href
-
-    return products, next_url
-
-
-def scrape_category(handle):
-    """
-    Fetch one category using ?all=1, which loads the entire category
-    on a single page (confirmed working) instead of paginating through
-    the default page size.
-    """
-    url = f"{BASE_URL}/{handle}?all=1"
-    products, _ = scrape_listing_page(url)
-    return products
-
-
-def scrape_all_categories():
-    """Crawl every configured category page for full-catalogue coverage."""
     all_products = []
-    seen_handles = set()
-    for handle in CATEGORY_PAGES:
-        print(f"  Crawling category: {handle}")
-        products = scrape_category(handle)
-        for p in products:
-            if p["handle"] not in seen_handles:
-                seen_handles.add(p["handle"])
-                all_products.append(p)
-        print(f"    {len(products)} products found in {handle} (running total: {len(all_products)})")
-        time.sleep(REQUEST_DELAY + random.uniform(0, 1))
+    seen_urls    = set()
+    page         = 1
+
+    while True:
+        params = {"all": "1"}
+        if page > 1:
+            params["page"] = str(page)
+        try:
+            r = SESSION.get(LISTING_URL, params=params, timeout=20)
+            if r.status_code == 404:
+                break
+            r.raise_for_status()
+        except Exception as e:
+            print(f"  [!] Listing page {page} error: {e}")
+            break
+
+        soup = BeautifulSoup(r.text, "html.parser")
+        batch = []
+
+        for h3 in soup.find_all("h3"):
+            a = h3.find("a", href=True)
+            if not a:
+                continue
+            href = a["href"]
+            if not href.startswith("http"):
+                href = BASE_URL + href
+            if any(x in href for x in ["?", "#", "/account", "/wishlist", "/cart"]):
+                continue
+            if href in seen_urls:
+                continue
+            seen_urls.add(href)
+
+            title = a.get_text(strip=True)
+            if not title or len(title) < 3:
+                continue
+
+            is_options = "(options)" in title.lower() or href.rstrip("/").endswith("-options")
+
+            # Walk up to container for price/stock
+            container = h3.parent
+            for _ in range(5):
+                if container is None:
+                    break
+                t = container.get_text(" ", strip=True)
+                if re.search(r"£[\d.]+", t):
+                    break
+                container = container.parent
+
+            text = container.get_text(" ", strip=True) if container else ""
+
+            # OOS for non-options products only
+            listing_oos = False
+            if not is_options:
+                if "more stock coming soon" in text.lower():
+                    listing_oos = True
+                if "out of stock" in text.lower() and "add to" not in text.lower():
+                    listing_oos = True
+
+            prices = re.findall(r"£\s*([\d.]+)", text)
+            price = prices[0] if prices else ""
+
+            img_el = container.find("img") if container else None
+            image = ""
+            if img_el:
+                src = img_el.get("data-src") or img_el.get("src") or ""
+                if src and "logo" not in src.lower():
+                    image = src if src.startswith("http") else BASE_URL + src
+
+            batch.append({
+                "url":        href,
+                "handle":     href.replace(BASE_URL, "").strip("/"),
+                "title":      title,
+                "price":      price,
+                "image":      image,
+                "is_options": is_options,
+                "in_stock":   not listing_oos,
+            })
+
+        all_products.extend(batch)
+        print(f"  Listing page {page}: +{len(batch)} (total: {len(all_products)})")
+
+        # Has next page?
+        total_m = re.search(r"Showing\s+[\d\s–-]+of\s+([\d,]+)", r.text)
+        has_next = False
+        if total_m:
+            total = int(total_m.group(1).replace(",", ""))
+            if page * 30 < total:
+                has_next = True
+        if not has_next:
+            has_next = bool(soup.find("a", href=lambda h: h and f"page={page+1}" in (h or "")))
+
+        if not has_next or not batch:
+            break
+        page += 1
+        time.sleep(REQUEST_DELAY)
+
     return all_products
 
+
 # ---------------------------------------------------------------------------
-# SCRAPING — PRODUCT DETAIL PAGE
+# SCRAPING — product detail page (options-aware)
 # ---------------------------------------------------------------------------
 
-def scrape_product_detail(product):
-    """
-    Fetch the product page for barcode, exact stock (if shown), sale price,
-    and accurate in-stock detection (EKM shows a "notify me when available"
-    form for OOS products, which is a reliable signal beyond a stock badge).
-    """
-    url = product["url"]
-    soup = get_soup(url)
-    if not soup:
-        return product
+def _extract_ean(html, soup):
+    m = re.search(r"Barcode\s*\(?GTIN/EAN\)?\s*:?\s*([0-9]{7,14})", html, re.IGNORECASE)
+    if m:
+        return m.group(1)
+    for script in soup.find_all("script", type="application/ld+json"):
+        try:
+            data = json.loads(script.string or "")
+            for item in (data if isinstance(data, list) else [data]):
+                ean = item.get("gtin13") or item.get("gtin") or item.get("gtin8") or ""
+                if ean and re.match(r"^\d{7,14}$", str(ean)):
+                    return str(ean)
+        except Exception:
+            pass
+    text = soup.get_text(" ", strip=True)
+    for pat in [r"EAN\s*:\s*([0-9]{7,14})", r"Barcode\s*:\s*([0-9]{7,14})"]:
+        m2 = re.search(pat, text, re.IGNORECASE)
+        if m2:
+            return m2.group(1)
+    return ""
 
+
+def _is_oos_page(text):
+    oos_signals = ["more stock coming soon", "notify me when in stock",
+                   "notify me when available", "currently out of stock"]
+    if any(s in text.lower() for s in oos_signals):
+        return True
+    if "out of stock" in text.lower() and "add to basket" not in text.lower():
+        return True
+    return False
+
+
+def scrape_product_detail(url, is_options):
+    """
+    Scrape a product detail page.
+    Returns a list of variant dicts — one entry per in-stock shade for
+    Options products, or a single entry for regular products.
+
+    Each dict: {handle_key, shade, price, ean, image, in_stock}
+    handle_key = "handle" for single products,
+                 "handle::shade_name" for options variants.
+    """
+    handle = url.replace(BASE_URL, "").strip("/")
+    try:
+        r = SESSION.get(url, timeout=20)
+        r.raise_for_status()
+        html = r.text
+        soup = BeautifulSoup(html, "html.parser")
+    except Exception as e:
+        print(f"  [!] Detail fetch error: {e}")
+        return []
+
+    og_img = soup.find("meta", property="og:image")
+    image  = og_img["content"] if og_img else ""
+
+    price_els = soup.find_all(class_=lambda c: c and "price" in str(c).lower())
+    price = ""
+    for el in price_els:
+        m = re.search(r"£\s*([\d.]+)", el.get_text())
+        if m:
+            try:
+                if float(m.group(1)) > 0:
+                    price = m.group(1)
+                    break
+            except ValueError:
+                pass
+
+    ean  = _extract_ean(html, soup)
     text = soup.get_text(" ", strip=True)
 
-    # Title
-    h1 = soup.find("h1")
-    if h1:
-        product["title"] = h1.get_text(strip=True)
+    if not is_options:
+        return [{
+            "handle_key": handle,
+            "shade":      "",
+            "price":      price,
+            "ean":        ean,
+            "image":      image,
+            "in_stock":   not _is_oos_page(text),
+        }]
 
-    # Barcode — confirmed label on this storefront is "Barcode (GTIN/EAN):"
-    # in the "Further Info" / "Identification" table on the product page.
-    label_m = re.search(r"Barcode\s*\(GTIN/EAN\)[:\s]+(\d{8,14})", text, re.IGNORECASE)
-    if not label_m:
-        # Fall back to a looser label match, then a bare 12-14 digit number
-        label_m = re.search(r"(?:Barcode|GTIN|EAN)[:\s]+(\d{8,14})", text, re.IGNORECASE)
-    if label_m:
-        product["barcode"] = label_m.group(1)
-    else:
-        bc_m = re.search(r"\b(\d{12,14})\b", text)
-        if bc_m:
-            product["barcode"] = bc_m.group(1)
+    # --- Options product: parse select dropdown ---
+    select = soup.find("select")
+    if not select:
+        # No dropdown found — treat as single
+        return [{
+            "handle_key": handle,
+            "shade":      "",
+            "price":      price,
+            "ean":        ean,
+            "image":      image,
+            "in_stock":   not _is_oos_page(text),
+        }]
 
-    # Price — prefer the confirmed product price element (same EKM theme
-    # component used on listing pages: <span class="price">£X.XX</span>).
-    # A blind regex over the whole page text was unreliable — it could
-    # match an unrelated £ amount first (delivery banners, basket
-    # subtotal showing "£0.00", etc.) before reaching the real price.
-    # For options products EKM renders "£0.00 £2.75" — the first value
-    # is the basket price placeholder, the second is the real unit price.
-    # We find ALL price values in the price element and take the first
-    # non-zero one, which is always the real selling price.
-    price_el = soup.find("span", class_="price")
-    if price_el:
-        price_text = price_el.get_text(" ", strip=True)
-        sale_m = re.search(r"WAS\s*£\s*([\d.]+)\s*NOW\s*£\s*([\d.]+)", price_text, re.IGNORECASE)
-        if sale_m:
-            product["compare_price"] = sale_m.group(1)
-            product["price"] = sale_m.group(2)
-        else:
-            # Find all prices and use the first non-zero one
-            all_prices = re.findall(r"([\d]+\.[\d]{2})", price_text)
-            for p in all_prices:
-                if float(p) > 0:
-                    product["price"] = p
-                    break
-    else:
-        sale_m = re.search(r"WAS\s*£\s*([\d.]+)\s*NOW\s*£\s*([\d.]+)", text, re.IGNORECASE)
-        if sale_m:
-            product["compare_price"] = sale_m.group(1)
-            product["price"] = sale_m.group(2)
-        else:
-            # Find all £ amounts and use first non-zero
-            all_prices = re.findall(r"£\s*([\d]+\.[\d]{2})", text)
-            for p in all_prices:
-                if float(p) > 0:
-                    product["price"] = p
-                    break
+    results = []
+    for option in select.find_all("option"):
+        opt_text = option.get_text(strip=True)
+        opt_val  = option.get("value", "").strip()
 
-    # Sanity guard: a scraped price of exactly 0 is virtually always a
-    # scraping error (no wholesale cosmetics product is free), not a
-    # real price. Discard it so check_changes() falls back to the last
-    # known good price from the snapshot instead.
-    if product.get("price") in ("0", "0.0", "0.00"):
-        product["price"] = ""
+        if not opt_val or opt_text.lower() in ("please select...", "select", ""):
+            continue
 
-    # Exact stock count, if the theme exposes it (varies by product/theme block)
-    stock_m = re.search(r"(\d+)\s+(?:in stock|available|units? available)", text, re.IGNORECASE)
-    if stock_m:
-        product["stock"] = int(stock_m.group(1))
-    else:
-        product.setdefault("stock", None)
+        # OOS detection: disabled attr or "out of stock" / "unavailable" in text
+        is_oos = (
+            option.has_attr("disabled") or
+            "out of stock" in opt_text.lower() or
+            "unavailable" in opt_text.lower()
+        )
 
-    # In-stock detection — prefer the same stock indicator span used on
-    # listing pages; fall back to the "notify me when available" signal,
-    # then to plain "out of stock" text matching.
-    stock_span = soup.find("span", class_=re.compile(r"item-(in|out-of)-stock"))
-    if stock_span:
-        stock_classes = " ".join(stock_span.get("class", []))
-        product["in_stock"] = "out-of-stock" not in stock_classes
-    elif "notify" in text.lower() and "available" in text.lower() and "out of stock" in text.lower():
-        product["in_stock"] = False
-    elif "out of stock" in text.lower():
-        product["in_stock"] = False
-    else:
-        product["in_stock"] = True
+        # Extract shade name — format: "SHADE_NAME (CODE)" or "SHADE_NAME (Out of Stock)"
+        m_code = re.search(r"^(.+?)\s*\((\d{3,6})\)\s*$", opt_text)
+        shade_name = m_code.group(1).strip() if m_code else re.sub(r"\s*\([^)]*\)\s*$", "", opt_text).strip()
 
-    # Image — prefer og:image
-    og_img = soup.find("meta", property="og:image")
-    if og_img and og_img.get("content"):
-        product["image"] = og_img["content"]
+        results.append({
+            "handle_key": f"{handle}::{shade_name}",
+            "shade":      shade_name,
+            "price":      price,
+            "ean":        ean,
+            "image":      image,
+            "in_stock":   not is_oos,
+        })
 
-    # Variant/shade options — products with "(Options)" in the title are
-    # sold as a single wholesale assortment covering multiple shades
-    # (e.g. "Options: 040 Tan, 050 Rich" — one price/stock for the whole
-    # mixed pack, not separate variants with their own price/stock/URL).
-    # We surface the shade list on the alert so it's visible, but don't
-    # track each shade as a separate snapshot entry since there's no
-    # separate price/stock data to compare per shade on this storefront.
-    options_m = re.search(r"Options:\s*([^.]+?)(?:\.\s|Please note|$)", text)
-    if options_m:
-        shades = options_m.group(1).strip().rstrip(",")
-        product["variant_options"] = shades
-    else:
-        product.setdefault("variant_options", "")
+    return results
 
-    return product
 
 # ---------------------------------------------------------------------------
-# PRICING HELPERS
+# DISCORD
 # ---------------------------------------------------------------------------
 
-def vat_price(price_str):
-    try:
-        return f"{float(price_str) * 1.2:.2f}"
-    except (ValueError, TypeError):
-        return price_str
-
-
-def safe_float(val):
-    try:
-        return float(val)
-    except (TypeError, ValueError):
-        return None
-
-
-def selleramp_url_ean(barcode, cost_price_str):
-    if not barcode:
-        return None
-    return (
-        f"https://sas.selleramp.com/sas/lookup/"
-        f"?search_term={barcode}&sas_cost_price={vat_price(cost_price_str)}"
-    )
-
-
-def selleramp_url_title(title, cost_price_str):
-    if not title:
-        return None
-    from urllib.parse import quote as _q
-    return (
-        f"https://sas.selleramp.com/sas/lookup/"
-        f"?search_term={_q(title)}&sas_cost_price={vat_price(cost_price_str)}"
-    )
-
-# ---------------------------------------------------------------------------
-# DISCORD EMBEDS
-# ---------------------------------------------------------------------------
-
-def _base_fields(product):
-    barcode  = product.get("barcode", "")
-    title    = product.get("title", "")
-    stock    = product.get("stock")
-    in_stock = product.get("in_stock", True)
-    price    = product.get("price", "")
-    sas_ean   = selleramp_url_ean(barcode, price)
-    sas_title = selleramp_url_title(title, price)
-
-    if stock is not None:
-        stock_val = f"**{stock}** units"
-    elif in_stock:
-        stock_val = "✅ In stock"
-    else:
-        stock_val = "❌ Out of stock"
-
-    fields = [
-        {"name": "🔢 Barcode", "value": f"`{barcode}`" if barcode else "-", "inline": True},
-        {"name": "📊 Stock",   "value": stock_val,                          "inline": True},
-    ]
-
-    shades = product.get("variant_options", "")
-    if shades:
-        display_shades = shades if len(shades) <= 300 else shades[:297] + "..."
-        fields.append({"name": "🎨 Shades in this pack", "value": display_shades, "inline": False})
-
-    if sas_title:
-        fields.append({"name": "🔍 SAS Title", "value": f"[Search by title]({sas_title})", "inline": True})
-    if sas_ean:
-        fields.append({"name": "🔍 SAS EAN", "value": f"[Search by barcode]({sas_ean})", "inline": True})
-    return fields
-
-
-def _send_embed(embed, content=None):
-    payload = {"embeds": [embed]}
-    if content:
-        payload["content"] = content
+def _send(payload):
+    if not DISCORD_WEBHOOK:
+        return
     try:
         r = requests.post(DISCORD_WEBHOOK, json=payload, timeout=10)
         if r.status_code == 429:
@@ -446,125 +318,75 @@ def _send_embed(embed, content=None):
         print(f"  [!] Discord error: {e}")
 
 
-def _thumbnail(product):
-    image = product.get("image", "")
-    return {"url": image} if image else None
-
-
-def _price_display(product):
-    price   = product.get("price", "")
-    compare = product.get("compare_price", "")
-    if price in ("0", "0.0", "0.00"):
-        price = ""
-    if compare and compare != price:
-        return f"£{compare} -> **£{price}**" if price else "-"
-    return f"**£{price}**" if price else "-"
-
-
-def notify_new(product):
-    price = product.get("price", "")
-    if price in ("0", "0.0", "0.00"):
-        price = ""
-    fields = [
-        {"name": "💰 Price (ex. VAT)",  "value": _price_display(product),                "inline": True},
-        {"name": "💷 Price (inc. VAT)", "value": f"£{vat_price(price)}" if price else "-", "inline": True},
-    ] + _base_fields(product)
-
+def _embed(title, url, colour, fields, image=""):
     embed = {
-        "title":     f"🆕  NEW LISTING — {product.get('title', '')}",
-        "url":       product.get("url", BASE_URL),
-        "color":     COLOUR_NEW,
-        "fields":    fields,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "footer":    {"text": "Shure Cosmetics Monitor • shure-cosmetics.co.uk"},
-    }
-    t = _thumbnail(product)
-    if t: embed["thumbnail"] = t
-    _send_embed(embed)
-    print(f"  Discord: NEW — {product.get('title', '')[:60]}")
-
-
-def notify_price_change(product, old_price, new_price, pct_change):
-    old_f = safe_float(old_price)
-    new_f = safe_float(new_price)
-    diff  = f"£{abs(new_f - old_f):.2f}" if old_f and new_f else "?"
-    pct_display = f"{pct_change * 100:.1f}%"
-
-    if pct_change >= 0.20:
-        colour = 0x00C853
-        tier   = "🔥"
-    elif pct_change >= 0.10:
-        colour = 0x2ECC71
-        tier   = "💰"
-    else:
-        colour = 0x82E0AA
-        tier   = "💵"
-
-    fields = [
-        {"name": "💰 Old Price", "value": f"£{old_price}",     "inline": True},
-        {"name": "💰 New Price", "value": f"**£{new_price}**", "inline": True},
-        {"name": "📉 Drop",      "value": f"↓ {diff} (**{pct_display}**)", "inline": True},
-    ] + _base_fields(product)
-
-    embed = {
-        "title":     f"{tier}  PRICE DROP -{pct_display} — {product.get('title', '')}",
-        "url":       product.get("url", BASE_URL),
+        "title":     title,
+        "url":       url,
         "color":     colour,
         "fields":    fields,
         "timestamp": datetime.now(timezone.utc).isoformat(),
-        "footer":    {"text": "Shure Cosmetics Monitor • shure-cosmetics.co.uk"},
+        "footer":    {"text": "Shure Cosmetics Monitor • store.shure-cosmetics.co.uk"},
     }
-    t = _thumbnail(product)
-    if t: embed["thumbnail"] = t
-    mention = FNF_MENTION if pct_change >= 0.25 else None
-    _send_embed(embed, content=mention)
-    print(f"  Discord: PRICE DROP -{pct_display} — {product.get('title', '')[:50]}")
+    if image:
+        embed["thumbnail"] = {"url": image}
+    return embed
 
 
-def notify_stock_change(product, old_stock, new_stock):
-    """Restock only — stock decreases are no longer tracked."""
-    diff = (new_stock - old_stock) if (new_stock is not None and old_stock is not None) else "?"
-    fields = [
-        {"name": "📊 Old Stock", "value": f"{old_stock} units",     "inline": True},
-        {"name": "📊 New Stock", "value": f"**{new_stock} units**", "inline": True},
-        {"name": "📈 Change",    "value": f"↑ +{diff} units" if isinstance(diff, int) else "-", "inline": True},
-    ] + _base_fields(product)
+def _fields(variant):
+    price  = variant.get("price", "")
+    ean    = variant.get("ean", "")
+    shade  = variant.get("shade", "")
+    inc    = f"{float(price)*1.2:.2f}" if price else ""
 
-    embed = {
-        "title":     f"🟢  RESTOCK — {product.get('title', '')}",
-        "url":       product.get("url", BASE_URL),
-        "color":     COLOUR_RESTOCK,
-        "fields":    fields,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "footer":    {"text": "Shure Cosmetics Monitor • shure-cosmetics.co.uk"},
-    }
-    t = _thumbnail(product)
-    if t: embed["thumbnail"] = t
-    _send_embed(embed)
-    print(f"  Discord: RESTOCK — {product.get('title', '')[:50]}")
+    rows = []
+    if shade:
+        rows.append({"name": "🎨 Shade",       "value": shade,                        "inline": True})
+    rows.append(    {"name": "💰 Price (ex-VAT)", "value": f"£{price}" if price else "-", "inline": True})
+    rows.append(    {"name": "💷 Price (inc-VAT)","value": f"£{inc}" if inc else "-",   "inline": True})
+    rows.append(    {"name": "🔢 EAN",           "value": f"`{ean}`" if ean else "-",   "inline": True})
+
+    sas_base = f"https://sas.selleramp.com/sas/lookup/?sas_cost_price={inc}"
+    if ean:
+        rows.append({"name": "🔍 SAS EAN",   "value": f"[Search by barcode]({sas_base}&search_term={ean})", "inline": True})
+    title = variant.get("title", "")
+    if title:
+        rows.append({"name": "🔍 SAS Title", "value": f"[Search by title]({sas_base}&search_term={quote(title)})", "inline": True})
+    return rows
 
 
-def notify_back_in_stock(product):
-    price = product.get("price", "")
-    if price in ("0", "0.0", "0.00"):
-        price = ""
-    fields = [
-        {"name": "💰 Price (ex. VAT)",  "value": _price_display(product),                "inline": True},
-        {"name": "💷 Price (inc. VAT)", "value": f"£{vat_price(price)}" if price else "-", "inline": True},
-    ] + _base_fields(product)
+def notify_new(variant):
+    shade_tag = f" — {variant['shade']}" if variant.get("shade") else ""
+    _send({"embeds": [_embed(
+        f"🆕  NEW — {variant['title']}{shade_tag}",
+        variant["url"], COLOUR_NEW, _fields(variant), variant.get("image","")
+    )]})
+    print(f"  ✅ NEW: {variant['title'][:55]}{shade_tag}")
 
-    embed = {
-        "title":     f"🟢  BACK IN STOCK — {product.get('title', '')}",
-        "url":       product.get("url", BASE_URL),
-        "color":     COLOUR_BACK,
-        "fields":    fields,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "footer":    {"text": "Shure Cosmetics Monitor • shure-cosmetics.co.uk"},
-    }
-    t = _thumbnail(product)
-    if t: embed["thumbnail"] = t
-    _send_embed(embed)
-    print(f"  Discord: BACK IN STOCK — {product.get('title', '')[:60]}")
+
+def notify_back(variant):
+    shade_tag = f" — {variant['shade']}" if variant.get("shade") else ""
+    _send({"embeds": [_embed(
+        f"🟢  BACK IN STOCK — {variant['title']}{shade_tag}",
+        variant["url"], COLOUR_BACK, _fields(variant), variant.get("image","")
+    )]})
+    print(f"  ✅ BACK IN STOCK: {variant['title'][:50]}{shade_tag}")
+
+
+def notify_drop(variant, old_price, new_price, pct):
+    pct_str  = f"{pct*100:.1f}%"
+    abs_drop = float(old_price) - float(new_price)
+    shade_tag = f" — {variant['shade']}" if variant.get("shade") else ""
+    extra = [
+        {"name": "💰 Was",  "value": f"£{old_price}",                          "inline": True},
+        {"name": "💰 Now",  "value": f"**£{new_price}**",                       "inline": True},
+        {"name": "📉 Drop", "value": f"↓ £{abs_drop:.2f} (-{pct_str})",        "inline": True},
+    ] + _fields(variant)
+    _send({"embeds": [_embed(
+        f"📉  PRICE DROP -{pct_str} — {variant['title']}{shade_tag}",
+        variant["url"], COLOUR_DROP, extra, variant.get("image","")
+    )]})
+    print(f"  ✅ PRICE DROP -{pct_str}: {variant['title'][:45]}{shade_tag}")
+
 
 # ---------------------------------------------------------------------------
 # SNAPSHOT
@@ -576,199 +398,210 @@ def load_snapshot():
             with open(SNAPSHOT_FILE) as f:
                 return json.load(f)
         except json.JSONDecodeError as e:
-            print(f"  [!] Snapshot file is corrupted ({e}) — backing it up and starting fresh.")
+            bak = f"{SNAPSHOT_FILE}.bak.{int(time.time())}"
+            print(f"  [!] Snapshot corrupted — backed up to {bak}")
             try:
-                backup_name = f"{SNAPSHOT_FILE}.corrupted.{int(time.time())}"
-                os.rename(SNAPSHOT_FILE, backup_name)
-                print(f"  [!] Corrupted file saved as {backup_name}")
-            except OSError as backup_err:
-                print(f"  [!] Could not back up corrupted file: {backup_err}")
-            return {}
+                os.rename(SNAPSHOT_FILE, bak)
+            except OSError:
+                pass
     return {}
 
 
 def save_snapshot(data):
-    """Write atomically — write to a temp file then rename, so a crash
-    mid-write never leaves a corrupted snapshot.json behind."""
-    tmp_file = f"{SNAPSHOT_FILE}.tmp"
-    with open(tmp_file, "w") as f:
+    tmp = SNAPSHOT_FILE + ".tmp"
+    with open(tmp, "w") as f:
         json.dump(data, f, indent=2)
-    os.replace(tmp_file, SNAPSHOT_FILE)
+    os.replace(tmp, SNAPSHOT_FILE)
 
 
-def snapshot_entry(product):
+def to_entry(variant):
     return {
-        "title":           product.get("title", ""),
-        "url":             product.get("url", ""),
-        "image":           product.get("image", ""),
-        "barcode":         product.get("barcode", ""),
-        "price":           product.get("price", ""),
-        "compare_price":   product.get("compare_price", ""),
-        "in_stock":        product.get("in_stock", True),
-        "stock":           product.get("stock"),
-        "variant_options": product.get("variant_options", ""),
-        "shade_stock":     product.get("shade_stock", {}),
-        "first_seen":      product.get("first_seen", datetime.now(timezone.utc).isoformat()),
-        "last_updated":    datetime.now(timezone.utc).isoformat(),
+        "title":      variant.get("title", ""),
+        "url":        variant.get("url", ""),
+        "shade":      variant.get("shade", ""),
+        "price":      variant.get("price", ""),
+        "ean":        variant.get("ean", ""),
+        "image":      variant.get("image", ""),
+        "in_stock":   variant.get("in_stock", True),
+        "first_seen": variant.get("first_seen", datetime.now(timezone.utc).isoformat()),
+        "last_updated": datetime.now(timezone.utc).isoformat(),
     }
 
-# ---------------------------------------------------------------------------
-# CHANGE DETECTION
-# ---------------------------------------------------------------------------
-
-def check_changes(product, old):
-    """
-    Only fires alerts for:
-      - Back in stock (whole product or individual shades for options)
-      - Restock (stock count increased meaningfully)
-      - Price drop (>=5% AND >£0.05)
-    No alerts for: price increases, stock decreases, going OOS.
-    """
-    old_price    = old.get("price", "")
-    old_stock    = old.get("stock")
-    new_stock    = product.get("stock")
-    was_in_stock = old.get("in_stock", True)
-    now_in_stock = product.get("in_stock", True)
-
-    # Backfill missing fields from snapshot
-    for key in ("image", "barcode", "price", "variant_options"):
-        if not product.get(key):
-            product[key] = old.get(key, "")
-
-    new_price = product.get("price", "")
-    old_f = safe_float(old_price)
-    new_f = safe_float(new_price)
-
-    # --- Per-shade back-in-stock for options products ---
-    old_shade_stock = old.get("shade_stock", {})
-    new_shade_stock = product.get("shade_stock", {})
-
-    if old_shade_stock and new_shade_stock:
-        # Find shades that were OOS and are now in stock
-        newly_available = [
-            shade for shade, in_stock in new_shade_stock.items()
-            if in_stock and not old_shade_stock.get(shade, True)
-        ]
-        if newly_available:
-            # Build a modified product showing only the newly available shades
-            p = dict(product)
-            p["variant_options"] = f"✅ NOW IN STOCK: {', '.join(newly_available)}"
-            notify_back_in_stock(p)
-            time.sleep(1)
-    elif not was_in_stock and now_in_stock:
-        # Whole-product back in stock (no per-shade data)
-        notify_back_in_stock(product)
-        time.sleep(1)
-        return
-
-    if old_f and new_f and old_f > 0:
-        pct_change = (old_f - new_f) / old_f
-        abs_change = old_f - new_f
-        if pct_change >= 0.05 and abs_change > 0.05:  # 5%+ AND £0.05+ absolute
-            notify_price_change(product, old_price, new_price, pct_change)
-            time.sleep(1)
-
-    if old_stock is not None and new_stock is not None and was_in_stock and now_in_stock:
-        threshold = max(5, int(old_stock * 0.2))
-        if new_stock > old_stock + threshold:
-            notify_stock_change(product, old_stock, new_stock)
-            time.sleep(1)
 
 # ---------------------------------------------------------------------------
-# MAIN
+# MAIN CHECK
 # ---------------------------------------------------------------------------
 
 def run_check():
-    print(f"\n[{datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}] Checking Shure Cosmetics...")
+    now_str = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
+    print(f"\n[{now_str}] Checking Shure Cosmetics...")
 
     snapshot      = load_snapshot()
-    known_handles = set(snapshot.keys())
+    known_keys    = set(snapshot.keys())
     baseline_done = os.path.exists(BASELINE_FLAG)
     is_first_run  = not baseline_done
 
-    print("  Crawling full catalogue across all categories...")
-    all_products = scrape_all_categories()
-    if not all_products:
-        print("  [!] No products scraped — possible site issue")
+    # Step 1: Scrape listing page (fast — no detail page scrapes yet)
+    listing_products = fetch_all_listing_products()
+    if not listing_products:
+        print("  [!] Nothing scraped — skipping")
         return
 
-    current_handles = {p["handle"] for p in all_products}
-    new_handles      = current_handles - known_handles
+    # Step 2: For each listing product, scrape the detail page
+    # to get per-shade options, EAN, and accurate stock/price.
+    #
+    # IMPORTANT: We only scrape detail pages when NEEDED:
+    #   - Always for new products (not in snapshot)
+    #   - For existing products ONLY if the listing shows a price change
+    #     vs snapshot (quick pre-filter saves unnecessary requests)
+    #   - First run: scrape everything to build baseline
+
+    all_variants = []   # flat list of {handle_key, title, url, shade, price, ean, image, in_stock}
+    alerts_sent  = 0
+
+    for p in listing_products:
+        handle = p["handle"]
+        url    = p["url"]
+        title  = p["title"]
+        is_options = p["is_options"]
+
+        # Determine if we need a detail page scrape
+        # For options products: always scrape to get per-shade stock
+        # For single products: scrape if new OR price might have changed
+        existing_keys = [k for k in known_keys if k == handle or k.startswith(f"{handle}::")]
+        is_new_product = len(existing_keys) == 0
+
+        listing_price = p.get("price", "")
+        snap_price    = snapshot.get(handle, {}).get("price", "") if not is_options else ""
+        price_changed = listing_price and snap_price and listing_price != snap_price
+
+        needs_scrape = (
+            is_first_run or
+            is_new_product or
+            is_options or    # always scrape options — shade stock can change without listing change
+            price_changed
+        )
+
+        if needs_scrape:
+            time.sleep(REQUEST_DELAY + random.uniform(0, 0.5))
+            variants = scrape_product_detail(url, is_options)
+        else:
+            # Use cached data — no scrape needed
+            variants = [{
+                "handle_key": handle,
+                "shade":      "",
+                "price":      listing_price,
+                "ean":        snapshot.get(handle, {}).get("ean", ""),
+                "image":      p.get("image", "") or snapshot.get(handle, {}).get("image", ""),
+                "in_stock":   p.get("in_stock", True),
+            }]
+
+        # Enrich each variant with title + url (needed for Discord embeds)
+        for v in variants:
+            v["title"] = title
+            v["url"]   = url
+            all_variants.append(v)
+
+    print(f"  {len(all_variants)} variants processed ({len(listing_products)} products)")
 
     if is_first_run:
-        print(f"  First run — building baseline from {len(all_products)} products (no alerts)...")
-    else:
-        print(f"  {len(all_products)} products found, {len(new_handles)} new")
+        print(f"  First run — building baseline. No alerts will fire.")
 
-    # Filter to monitored brands only before processing
-    all_products = [p for p in all_products if is_monitored_brand(p.get("title", ""))]
-    print(f"  {len(all_products)} products from monitored brands (Maybelline, L'Oréal, Rimmel, Revolution)")
+    # Step 3: Compare each variant against snapshot
+    new_snapshot = dict(snapshot)
 
-    for i, product in enumerate(all_products, 1):
-        handle = product["handle"]
+    for variant in all_variants:
+        key   = variant["handle_key"]
+        old   = snapshot.get(key, {})
 
-        # Enrich with detail page scrape for: baseline (in-stock only),
-        # new listings, and every existing product (to catch price/stock
-        # changes and reliable back-in-stock detection via the notify form)
-        should_scrape = (
-            (is_first_run and product.get("in_stock")) or
-            (handle in new_handles and product.get("in_stock")) or
-            (not is_first_run and handle not in new_handles)
-        )
-        if should_scrape:
-            time.sleep(REQUEST_DELAY + random.uniform(0, 1))
-            product = scrape_product_detail(product)
+        # Carry forward EAN/image if not scraped this cycle
+        for f in ("ean", "image"):
+            if not variant.get(f):
+                variant[f] = old.get(f, "")
 
         if is_first_run:
-            entry = snapshot_entry(product)
+            entry = to_entry(variant)
             entry["first_seen"] = datetime.now(timezone.utc).isoformat()
-            snapshot[handle] = entry
-        elif handle in new_handles:
-            if product.get("in_stock", True):
-                print(f"  -> NEW: {product['title'][:60]}")
-                notify_new(product)
+            new_snapshot[key] = entry
+            continue
+
+        is_new_key    = key not in known_keys
+        was_in_stock  = old.get("in_stock", True)
+        now_in_stock  = variant.get("in_stock", True)
+        old_price     = old.get("price", "")
+        new_price     = variant.get("price", "")
+
+        # NEW listing
+        if is_new_key:
+            if now_in_stock:
+                notify_new(variant)
+                alerts_sent += 1
                 time.sleep(1.5)
-            entry = snapshot_entry(product)
+            entry = to_entry(variant)
             entry["first_seen"] = datetime.now(timezone.utc).isoformat()
-            snapshot[handle] = entry
-        else:
-            old = snapshot[handle]
-            check_changes(product, old)
-            entry = snapshot_entry(product)
-            entry["first_seen"] = old.get("first_seen", entry["first_seen"])
-            snapshot[handle] = entry
+            new_snapshot[key] = entry
+            continue
 
-        if i % 50 == 0:
-            save_snapshot(snapshot)
-            print(f"  Auto-saved at {i}/{len(all_products)}")
+        # BACK IN STOCK
+        if not was_in_stock and now_in_stock:
+            notify_back(variant)
+            alerts_sent += 1
+            time.sleep(1.5)
 
-    save_snapshot(snapshot)
+        # PRICE DROP (>=5% AND >£0.05)
+        elif now_in_stock and old_price and new_price:
+            try:
+                old_f = float(old_price)
+                new_f = float(new_price)
+                if old_f > 0:
+                    pct = (old_f - new_f) / old_f
+                    if pct >= 0.05 and (old_f - new_f) > 0.05:
+                        notify_drop(variant, old_price, new_price, pct)
+                        alerts_sent += 1
+                        time.sleep(1.5)
+            except ValueError:
+                pass
+
+        # Update snapshot
+        entry = to_entry(variant)
+        entry["first_seen"] = old.get("first_seen", entry["first_seen"])
+        new_snapshot[key] = entry
+
+    save_snapshot(new_snapshot)
 
     if is_first_run:
         with open(BASELINE_FLAG, "w") as f:
             f.write(datetime.now(timezone.utc).isoformat())
-        print(f"  Baseline complete — {len(snapshot)} products recorded. No alerts sent.")
+        print(f"  Baseline saved — {len(new_snapshot)} variants tracked.")
     else:
-        print(f"  Snapshot saved ({len(snapshot)} products tracked)")
+        print(f"  Done — {alerts_sent} alert(s) | {len(new_snapshot)} variants tracked.")
 
+
+# ---------------------------------------------------------------------------
+# ENTRY POINT
+# ---------------------------------------------------------------------------
 
 def main():
     print("=" * 55)
-    print("  Shure Cosmetics Monitor — Maybelline | L'Oréal | Rimmel | Revolution")
-    print(f"  Watching: {BASE_URL}")
-    print("  Tracking: new listings, price drops, restocks")
+    print("  Shure Cosmetics Monitor")
+    print(f"  {LISTING_URL}?all=1")
+    print("  Alerts: new listings | back in stock | price drops")
     print("=" * 55)
+
+    if not DISCORD_WEBHOOK:
+        print("  ⚠️  DISCORD_WEBHOOK not set")
 
     if RUN_ONCE:
         run_check()
-    else:
-        while True:
-            try:
-                run_check()
-            except Exception as e:
-                print(f"  [!] Unexpected error: {e}")
-            print(f"  Sleeping {CHECK_INTERVAL}s...")
-            time.sleep(CHECK_INTERVAL)
+        return
+
+    while True:
+        try:
+            run_check()
+        except Exception as e:
+            print(f"  [!] Unexpected error: {e}")
+        print(f"  Sleeping {CHECK_INTERVAL}s...")
+        time.sleep(CHECK_INTERVAL)
 
 
 if __name__ == "__main__":
