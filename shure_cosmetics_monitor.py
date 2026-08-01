@@ -62,6 +62,11 @@ def fetch_doofinder_page(page):
                 "rpp":    RESULTS_PER_PAGE,
                 "page":   page,
             },
+            headers={
+                "Origin":  "https://store.shure-cosmetics.co.uk",
+                "Referer": "https://store.shure-cosmetics.co.uk/",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            },
             timeout=20,
         )
         r.raise_for_status()
